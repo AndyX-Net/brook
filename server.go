@@ -1,3 +1,17 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
@@ -10,7 +24,7 @@ import (
 	"github.com/txthinking/socks5"
 )
 
-// Server
+// Server.
 type Server struct {
 	Password     []byte
 	TCPAddr      *net.TCPAddr
@@ -23,7 +37,7 @@ type Server struct {
 	UDPDeadline  int
 }
 
-// NewServer
+// NewServer.
 func NewServer(addr, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Server, error) {
 	taddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -33,7 +47,7 @@ func NewServer(addr, password string, tcpTimeout, tcpDeadline, udpDeadline int) 
 	if err != nil {
 		return nil, err
 	}
-	cs := cache.New(60*time.Minute, 10*time.Minute)
+	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
 	s := &Server{
 		Password:     []byte(password),
 		TCPAddr:      taddr,
@@ -46,7 +60,7 @@ func NewServer(addr, password string, tcpTimeout, tcpDeadline, udpDeadline int) 
 	return s, nil
 }
 
-// Run server
+// Run server.
 func (s *Server) ListenAndServe() error {
 	errch := make(chan error)
 	go func() {
@@ -58,7 +72,7 @@ func (s *Server) ListenAndServe() error {
 	return <-errch
 }
 
-// RunTCPServer starts tcp server
+// RunTCPServer starts tcp server.
 func (s *Server) RunTCPServer() error {
 	var err error
 	s.TCPListen, err = net.ListenTCP("tcp", s.TCPAddr)
@@ -93,7 +107,7 @@ func (s *Server) RunTCPServer() error {
 	return nil
 }
 
-// RunUDPServer starts udp server
+// RunUDPServer starts udp server.
 func (s *Server) RunUDPServer() error {
 	var err error
 	s.UDPConn, err = net.ListenUDP("udp", s.UDPAddr)
@@ -117,7 +131,7 @@ func (s *Server) RunUDPServer() error {
 	return nil
 }
 
-// TCPHandle handle request
+// TCPHandle handles request.
 func (s *Server) TCPHandle(c *net.TCPConn) error {
 	cn := make([]byte, 12)
 	if _, err := io.ReadFull(c, cn); err != nil {
@@ -133,6 +147,9 @@ func (s *Server) TCPHandle(c *net.TCPConn) error {
 		return err
 	}
 	address := socks5.ToAddress(b[0], b[1:len(b)-2], b[len(b)-2:])
+	if Debug {
+		log.Println("Dial TCP", address)
+	}
 	tmp, err := Dial.Dial("tcp", address)
 	if err != nil {
 		return err
@@ -194,7 +211,7 @@ func (s *Server) TCPHandle(c *net.TCPConn) error {
 	return nil
 }
 
-// UDPHandle handle packet
+// UDPHandle handles packet.
 func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 	a, h, p, data, err := Decrypt(s.Password, b)
 	if err != nil {
@@ -215,6 +232,9 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 		return send(ue, data)
 	}
 	address := socks5.ToAddress(a, h, p)
+	if Debug {
+		log.Println("Dial UDP", address)
+	}
 
 	c, err := Dial.Dial("udp", address)
 	if err != nil {
@@ -225,10 +245,11 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 		ClientAddr: addr,
 		RemoteConn: rc,
 	}
-	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
 	if err := send(ue, data); err != nil {
+		ue.RemoteConn.Close()
 		return err
 	}
+	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
 	go func(ue *socks5.UDPExchange) {
 		defer func() {
 			s.UDPExchanges.Delete(ue.ClientAddr.String())
@@ -268,7 +289,7 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 	return nil
 }
 
-// Shutdown server
+// Shutdown server.
 func (s *Server) Shutdown() error {
 	var err, err1 error
 	if s.TCPListen != nil {

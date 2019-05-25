@@ -1,7 +1,20 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
-	"io"
 	"log"
 	"net"
 	"time"
@@ -10,7 +23,7 @@ import (
 	"github.com/txthinking/socks5"
 )
 
-// Relay is stream relay server
+// Relay is relay server.
 type Relay struct {
 	TCPAddr       *net.TCPAddr
 	UDPAddr       *net.UDPAddr
@@ -19,12 +32,12 @@ type Relay struct {
 	TCPListen     *net.TCPListener
 	UDPConn       *net.UDPConn
 	UDPExchanges  *cache.Cache
-	TCPDeadline   int // Not refreshed
+	TCPDeadline   int
 	TCPTimeout    int
 	UDPDeadline   int
 }
 
-// NewRelay
+// NewRelay returns a Relay.
 func NewRelay(addr, remote string, tcpTimeout, tcpDeadline, udpDeadline int) (*Relay, error) {
 	taddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -42,7 +55,7 @@ func NewRelay(addr, remote string, tcpTimeout, tcpDeadline, udpDeadline int) (*R
 	if err != nil {
 		return nil, err
 	}
-	cs := cache.New(60*time.Minute, 10*time.Minute)
+	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
 	s := &Relay{
 		TCPAddr:       taddr,
 		UDPAddr:       uaddr,
@@ -56,7 +69,7 @@ func NewRelay(addr, remote string, tcpTimeout, tcpDeadline, udpDeadline int) (*R
 	return s, nil
 }
 
-// Run server
+// Run server.
 func (s *Relay) ListenAndServe() error {
 	errch := make(chan error)
 	go func() {
@@ -68,7 +81,7 @@ func (s *Relay) ListenAndServe() error {
 	return <-errch
 }
 
-// RunTCPServer starts tcp server
+// RunTCPServer starts tcp server.
 func (s *Relay) RunTCPServer() error {
 	var err error
 	s.TCPListen, err = net.ListenTCP("tcp", s.TCPAddr)
@@ -103,7 +116,7 @@ func (s *Relay) RunTCPServer() error {
 	return nil
 }
 
-// RunUDPServer starts udp server
+// RunUDPServer starts udp server.
 func (s *Relay) RunUDPServer() error {
 	var err error
 	s.UDPConn, err = net.ListenUDP("udp", s.UDPAddr)
@@ -127,7 +140,7 @@ func (s *Relay) RunUDPServer() error {
 	return nil
 }
 
-// Shutdown server
+// Shutdown server.
 func (s *Relay) Shutdown() error {
 	var err, err1 error
 	if s.TCPListen != nil {
@@ -142,7 +155,7 @@ func (s *Relay) Shutdown() error {
 	return err1
 }
 
-// TCPHandle handle request
+// TCPHandle handles request.
 func (s *Relay) TCPHandle(c *net.TCPConn) error {
 	tmp, err := Dial.Dial("tcp", s.RemoteTCPAddr.String())
 	if err != nil {
@@ -162,13 +175,41 @@ func (s *Relay) TCPHandle(c *net.TCPConn) error {
 	}
 
 	go func() {
-		_, _ = io.Copy(c, rc)
+		var bf [1024 * 2]byte
+		for {
+			if s.TCPDeadline != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
+					return
+				}
+			}
+			i, err := rc.Read(bf[:])
+			if err != nil {
+				return
+			}
+			if _, err := c.Write(bf[0:i]); err != nil {
+				return
+			}
+		}
 	}()
-	_, _ = io.Copy(rc, c)
+	var bf [1024 * 2]byte
+	for {
+		if s.TCPDeadline != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
+				return nil
+			}
+		}
+		i, err := c.Read(bf[:])
+		if err != nil {
+			return nil
+		}
+		if _, err := rc.Write(bf[0:i]); err != nil {
+			return nil
+		}
+	}
 	return nil
 }
 
-// UDPHandle handle packet
+// UDPHandle handles packet.
 func (s *Relay) UDPHandle(addr *net.UDPAddr, b []byte) error {
 	send := func(ue *socks5.UDPExchange, data []byte) error {
 		_, err := ue.RemoteConn.Write(data)
@@ -194,10 +235,11 @@ func (s *Relay) UDPHandle(addr *net.UDPAddr, b []byte) error {
 		ClientAddr: addr,
 		RemoteConn: rc,
 	}
-	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
 	if err := send(ue, b); err != nil {
+		ue.RemoteConn.Close()
 		return err
 	}
+	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
 	go func(ue *socks5.UDPExchange) {
 		defer func() {
 			s.UDPExchanges.Delete(ue.ClientAddr.String())

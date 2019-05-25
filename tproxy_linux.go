@@ -15,20 +15,22 @@
 package brook
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"time"
 
 	cache "github.com/patrickmn/go-cache"
+	"github.com/txthinking/brook/tproxy"
 	"github.com/txthinking/socks5"
 )
 
-// Tunnel.
-type Tunnel struct {
+// Tproxy.
+type Tproxy struct {
 	TCPAddr       *net.TCPAddr
 	UDPAddr       *net.UDPAddr
-	ToAddr        string
 	RemoteTCPAddr *net.TCPAddr
 	RemoteUDPAddr *net.UDPAddr
 	Password      []byte
@@ -40,8 +42,8 @@ type Tunnel struct {
 	UDPDeadline   int
 }
 
-// NewTunnel.
-func NewTunnel(addr, to, remote, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Tunnel, error) {
+// NewTproxy.
+func NewTproxy(addr, remote, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Tproxy, error) {
 	taddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -59,8 +61,7 @@ func NewTunnel(addr, to, remote, password string, tcpTimeout, tcpDeadline, udpDe
 		return nil, err
 	}
 	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
-	s := &Tunnel{
-		ToAddr:        to,
+	s := &Tproxy{
 		Password:      []byte(password),
 		TCPAddr:       taddr,
 		UDPAddr:       uaddr,
@@ -75,7 +76,7 @@ func NewTunnel(addr, to, remote, password string, tcpTimeout, tcpDeadline, udpDe
 }
 
 // Run server.
-func (s *Tunnel) ListenAndServe() error {
+func (s *Tproxy) ListenAndServe() error {
 	errch := make(chan error)
 	go func() {
 		errch <- s.RunTCPServer()
@@ -87,9 +88,9 @@ func (s *Tunnel) ListenAndServe() error {
 }
 
 // RunTCPServer starts tcp server.
-func (s *Tunnel) RunTCPServer() error {
+func (s *Tproxy) RunTCPServer() error {
 	var err error
-	s.TCPListen, err = net.ListenTCP("tcp", s.TCPAddr)
+	s.TCPListen, err = tproxy.ListenTCP("tcp", s.TCPAddr)
 	if err != nil {
 		return err
 	}
@@ -122,31 +123,34 @@ func (s *Tunnel) RunTCPServer() error {
 }
 
 // RunUDPServer starts udp server.
-func (s *Tunnel) RunUDPServer() error {
+func (s *Tproxy) RunUDPServer() error {
 	var err error
-	s.UDPConn, err = net.ListenUDP("udp", s.UDPAddr)
+	s.UDPConn, err = tproxy.ListenUDP("udp", s.UDPAddr)
 	if err != nil {
 		return err
 	}
 	defer s.UDPConn.Close()
 	for {
 		b := make([]byte, 65536)
-		n, addr, err := s.UDPConn.ReadFromUDP(b)
+		n, saddr, daddr, err := tproxy.ReadFromUDP(s.UDPConn, b)
 		if err != nil {
 			return err
 		}
-		go func(addr *net.UDPAddr, b []byte) {
-			if err := s.UDPHandle(addr, b); err != nil {
+		if n == 0 {
+			continue
+		}
+		go func(saddr, daddr *net.UDPAddr, b []byte) {
+			if err := s.UDPHandle(saddr, daddr, b); err != nil {
 				log.Println(err)
 				return
 			}
-		}(addr, b[0:n])
+		}(saddr, daddr, b[0:n])
 	}
 	return nil
 }
 
 // Shutdown server.
-func (s *Tunnel) Shutdown() error {
+func (s *Tproxy) Shutdown() error {
 	var err, err1 error
 	if s.TCPListen != nil {
 		err = s.TCPListen.Close()
@@ -161,8 +165,8 @@ func (s *Tunnel) Shutdown() error {
 }
 
 // TCPHandle handles request.
-func (s *Tunnel) TCPHandle(c *net.TCPConn) error {
-	tmp, err := Dial.Dial("tcp", s.RemoteTCPAddr.String())
+func (s *Tproxy) TCPHandle(c *net.TCPConn) error {
+	tmp, err := tproxy.DialTCP("tcp", s.RemoteTCPAddr.String())
 	if err != nil {
 		return err
 	}
@@ -187,7 +191,7 @@ func (s *Tunnel) TCPHandle(c *net.TCPConn) error {
 		return err
 	}
 
-	a, address, port, err := socks5.ParseAddress(s.ToAddr)
+	a, address, port, err := socks5.ParseAddress(c.LocalAddr().String())
 	if err != nil {
 		return err
 	}
@@ -246,9 +250,13 @@ func (s *Tunnel) TCPHandle(c *net.TCPConn) error {
 	return nil
 }
 
-// UDPHandle handles packet.
-func (s *Tunnel) UDPHandle(addr *net.UDPAddr, b []byte) error {
-	a, address, port, err := socks5.ParseAddress(s.ToAddr)
+type UDPExchange struct {
+	RemoteConn *net.UDPConn
+	LocalConn  *net.UDPConn
+}
+
+func (s *Tproxy) UDPHandle(addr, daddr *net.UDPAddr, b []byte) error {
+	a, address, port, err := socks5.ParseAddress(daddr.String())
 	if err != nil {
 		return err
 	}
@@ -258,7 +266,7 @@ func (s *Tunnel) UDPHandle(addr *net.UDPAddr, b []byte) error {
 	rawaddr = append(rawaddr, port...)
 	b = append(rawaddr, b...)
 
-	send := func(ue *socks5.UDPExchange, data []byte) error {
+	send := func(ue *UDPExchange, data []byte) error {
 		cd, err := Encrypt(s.Password, data)
 		if err != nil {
 			return err
@@ -270,31 +278,40 @@ func (s *Tunnel) UDPHandle(addr *net.UDPAddr, b []byte) error {
 		return nil
 	}
 
-	var ue *socks5.UDPExchange
+	var ue *UDPExchange
 	iue, ok := s.UDPExchanges.Get(addr.String())
 	if ok {
-		ue = iue.(*socks5.UDPExchange)
+		ue = iue.(*UDPExchange)
 		return send(ue, b)
 	}
 
-	c, err := Dial.Dial("udp", s.RemoteUDPAddr.String())
+	rc, err := tproxy.DialUDP("udp", &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: 0,
+	}, s.RemoteUDPAddr)
 	if err != nil {
 		return err
 	}
-	rc := c.(*net.UDPConn)
-	ue = &socks5.UDPExchange{
-		ClientAddr: addr,
+	c, err := tproxy.DialUDP("udp", daddr, addr)
+	if err != nil {
+		rc.Close()
+		return errors.New(fmt.Sprintf("src: %s dst: %s %s", daddr.String(), addr.String(), err.Error()))
+	}
+	ue = &UDPExchange{
 		RemoteConn: rc,
+		LocalConn:  c,
 	}
 	if err := send(ue, b); err != nil {
 		ue.RemoteConn.Close()
+		ue.LocalConn.Close()
 		return err
 	}
-	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
-	go func(ue *socks5.UDPExchange) {
+	s.UDPExchanges.Set(ue.LocalConn.RemoteAddr().String(), ue, cache.DefaultExpiration)
+	go func(ue *UDPExchange) {
 		defer func() {
-			s.UDPExchanges.Delete(ue.ClientAddr.String())
+			s.UDPExchanges.Delete(ue.LocalConn.RemoteAddr().String())
 			ue.RemoteConn.Close()
+			ue.LocalConn.Close()
 		}()
 		var b [65536]byte
 		for {
@@ -309,10 +326,9 @@ func (s *Tunnel) UDPHandle(addr *net.UDPAddr, b []byte) error {
 			}
 			_, _, _, data, err := Decrypt(s.Password, b[0:n])
 			if err != nil {
-				log.Println(err)
 				break
 			}
-			if _, err := s.UDPConn.WriteToUDP(data, ue.ClientAddr); err != nil {
+			if _, err := ue.LocalConn.Write(data); err != nil {
 				break
 			}
 		}
